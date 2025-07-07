@@ -1,2 +1,6 @@
 PyQt6
 cryptography
+pyotp
+opencv-python
+pyzbar
+pyperclip

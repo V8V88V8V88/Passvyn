@@ -1,2 +1,5 @@
-/config.json
-/date.enc
+config.json
+data.enc
+*.pbk
+__pycache__/
+*.pyc
