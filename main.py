@@ -1,22 +1,21 @@
 import sys
 import os
-os.environ['QT_QPA_PLATFORM'] = 'xcb'
 import json
 import hashlib
 import secrets
+import html
+import tempfile
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, QTreeWidget, 
                              QTreeWidgetItem, QMessageBox, QInputDialog, QStyleFactory,
                              QListWidget, QListWidgetItem, QGroupBox, QGridLayout, 
-                             QStackedWidget, QSpacerItem, QSizePolicy, 
                              QProgressBar, QMenu, 
                              QDialog, QDialogButtonBox, QFileDialog, QLayout)
-from PyQt6.QtCore import Qt, QTimer, QSettings, QSize, QPoint
+from PyQt6.QtCore import Qt, QTimer, QSettings, QPoint
 from PyQt6.QtGui import QPalette, QColor, QAction, QIcon
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.backends import default_backend
 import base64
 import pyotp
 import time
@@ -24,14 +23,16 @@ import cv2
 from pyzbar import pyzbar
 import urllib.parse
 import pyperclip
-import shutil
+
+# Base directory for absolute path resolution
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # App details for QSettings
 ORG_NAME = "V8V88V8V88"
 APP_NAME = "Passvyn: PasswordManager"
 
-# Define icon paths (relative to main.py)
-ICON_DIR = "icons"
+# Define icon paths (relative to BASE_DIR)
+ICON_DIR = os.path.join(BASE_DIR, "icons")
 ICON_ADD = os.path.join(ICON_DIR, "plus-circle.svg")
 ICON_DELETE = os.path.join(ICON_DIR, "trash-2.svg")
 ICON_COPY = os.path.join(ICON_DIR, "copy.svg")
@@ -261,14 +262,20 @@ class SecuredPasswordManager:
         self.master_password_hash = None
         self.encryption_key = None
         self.salt = None
-        self.config_file = "config.json"
-        self.data_file = "data.enc"
+        self.config_file = os.path.join(BASE_DIR, "config.json")
+        self.data_file = os.path.join(BASE_DIR, "data.enc")
+
+    def hash_password(self, password, salt=None):
+        use_salt = salt if salt is not None else self.salt
+        if use_salt is None:
+            raise ValueError("Salt is required to hash password.")
+        return hashlib.sha256(use_salt + password.encode()).hexdigest()
 
     def load_config(self):
         # Reset state first
         self.master_password_hash = None
         self.salt = None
-        self.encryption_key = None # Ensure key is cleared too
+        self.encryption_key = None
         
         if os.path.exists(self.config_file):
             try:
@@ -279,53 +286,54 @@ class SecuredPasswordManager:
                 salt_b64 = config.get("salt")
 
                 if loaded_hash and salt_b64:
-                    # Validate salt decoding
                     try:
                          decoded_salt = base64.b64decode(salt_b64)
-                         if len(decoded_salt) != 16: # Basic sanity check for salt length
+                         if len(decoded_salt) != 16:
                               raise ValueError("Decoded salt has incorrect length.")
-                         # Only set if hash and valid salt are loaded
                          self.master_password_hash = loaded_hash
                          self.salt = decoded_salt
-                         print("Config loaded successfully.") # Debugging message
                     except Exception as e:
                          print(f"Error decoding salt from config: {e}. Config ignored.")
-                         # Keep state as None if salt is invalid
                 else:
                      print("Config file missing hash or salt. Config ignored.")
-                     # Keep state as None
             except Exception as e:
                 print(f"Error reading or parsing config file '{self.config_file}': {e}. Config ignored.")
-                # Keep state as None if file is corrupt
         else:
             print("Config file not found. Ready for initial setup.")
-            # State is already None, ready for setup
 
     def save_config(self):
+        if self.salt is None:
+            raise ValueError("Cannot save config without salt.")
         config = {
             "master_password_hash": self.master_password_hash,
             "salt": base64.b64encode(self.salt).decode()
         }
-        with open(self.config_file, "w") as file:
-            json.dump(config, file)
+        os.makedirs(os.path.dirname(os.path.abspath(self.config_file)), exist_ok=True)
+        temp_fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(self.config_file)), prefix="cfg_", suffix=".tmp")
+        try:
+            with os.fdopen(temp_fd, "w") as file:
+                json.dump(config, file, indent=2)
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, self.config_file)
+        except Exception:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
 
     def derive_key(self, master_password, salt=None):
         use_salt = salt if salt is not None else self.salt
-        if use_salt is None: # Should not happen after load_config/first setup
+        if use_salt is None:
              print("Error: Salt is missing for key derivation.")
              return None
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
             salt=use_salt,
-            iterations=100000,
-            backend=default_backend()
+            iterations=100000
         )
         return base64.urlsafe_b64encode(kdf.derive(master_password.encode()))
 
     def encrypt_data(self):
-        # Encrypts current data (passwords, totp) using instance key
-        # Writes to self.data_file
         if not self.encryption_key:
             raise Exception("Cannot encrypt data without encryption key.")
             
@@ -337,144 +345,127 @@ class SecuredPasswordManager:
         f = Fernet(self.encryption_key)
         encrypted_data = f.encrypt(json.dumps(data_to_encrypt).encode())
         
-        # Write to the standard data file
+        os.makedirs(os.path.dirname(os.path.abspath(self.data_file)), exist_ok=True)
+        temp_fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(self.data_file)), prefix="data_", suffix=".tmp")
         try:
-            with open(self.data_file, "wb") as file:
+            with os.fdopen(temp_fd, "wb") as file:
                 file.write(encrypted_data)
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, self.data_file)
         except Exception as e:
-            # Raise a more specific error if write fails
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
             raise IOError(f"Failed to write encrypted data to {self.data_file}: {e}")
 
     def decrypt_data(self, encrypted_blob=None, decryption_key=None):
-        # Decrypts either the standard data file or a provided blob
-        # using either the instance key or a provided key.
-        # Returns the loaded dictionary {passwords:[], totp_accounts:[]} or None on failure.
-        
         key_to_use = decryption_key if decryption_key is not None else self.encryption_key
         if key_to_use is None:
             print("Decryption skipped: No encryption key available.")
-            # Return structure indicating no data loaded 
-            return {"passwords": [], "totp_accounts": []} 
+            return None
             
         data_source = encrypted_blob
         if data_source is None:
             if not os.path.exists(self.data_file):
                 self.passwords = []
                 self.totp_accounts = []
-                return {"passwords": [], "totp_accounts": []} # Return structure
+                return {"passwords": [], "totp_accounts": []}
             try:
                 with open(self.data_file, "rb") as file:
                     data_source = file.read()
             except Exception as e:
                 print(f"Error reading data file {self.data_file}: {e}")
-                return None # Indicate failure
+                return None
                 
         if not data_source:
              print("Error: No data source for decryption.")
-             return None # Indicate failure
+             return None
 
         try:
             f = Fernet(key_to_use)
             decrypted_data_bytes = f.decrypt(data_source)
             loaded_data = json.loads(decrypted_data_bytes.decode())
             
-            # Validate structure 
             if not isinstance(loaded_data.get("passwords"), list) or \
                not isinstance(loaded_data.get("totp_accounts"), list):
                  raise ValueError("Decrypted data has incorrect format.")
                  
-            # If decrypting standard file (no blob provided), update instance state
             if encrypted_blob is None:
                 self.passwords = loaded_data.get("passwords", [])
                 self.totp_accounts = loaded_data.get("totp_accounts", [])
             
-            # Return the loaded data (just passwords/totp)
             return loaded_data
             
         except Exception as e:
             print(f"Error decrypting data: {e}")
-            # If decrypting standard file, clear instance data on failure
             if encrypted_blob is None:
                  self.passwords = []
                  self.totp_accounts = []
-            return None # Indicate failure
+            return None
 
     def verify_master_password(self, master_password):
-        # This method now ONLY verifies an EXISTING password
-        # Setup logic is moved to setup_initial_password
         if not self.master_password_hash or not self.salt:
-             # Should not happen if called after load_config unless config was invalid/missing
              print("Error: verify_master_password called with invalid/missing config state.")
              QMessageBox.critical(None, "Login Error", "Configuration missing or invalid. Cannot verify password.")
              return False
 
-        input_hash = hashlib.sha256(master_password.encode()).hexdigest()
-        if input_hash == self.master_password_hash:
-            # Hash matches. Now derive key using the loaded salt.
-            self.encryption_key = self.derive_key(master_password) # Uses self.salt
+        salted_hash = self.hash_password(master_password, self.salt)
+        legacy_hash = hashlib.sha256(master_password.encode()).hexdigest()
+
+        is_valid = secrets.compare_digest(salted_hash, self.master_password_hash)
+        if not is_valid and secrets.compare_digest(legacy_hash, self.master_password_hash):
+             is_valid = True
+             # Upgrade to salted hash
+             self.master_password_hash = salted_hash
+             self.save_config()
+
+        if is_valid:
+            self.encryption_key = self.derive_key(master_password)
             if not self.encryption_key:
-                 # Should not happen if salt is valid
-                 print("Error deriving encryption key despite matching hash and loaded salt.")
                  QMessageBox.critical(None, "Login Error", "Internal error: Failed to derive encryption key.")
                  return False
                  
-            # Attempt decryption to fully verify key/data integrity
             loaded_data = self.decrypt_data() 
             if loaded_data is None:
-                # Decryption failed even though hash matched and key was derived.
-                # This strongly points to data corruption or a mismatch between config/data files.
-                print("Decryption failed after successful password hash verification.")
                 QMessageBox.critical(None, "Login Error", "Password verified, but failed to decrypt data.\nThe data file ('data.enc') might be corrupted or out of sync with configuration.")
-                # Clear the key to prevent further ops with potentially bad key/data state
                 self.encryption_key = None 
                 return False
             else:
-                print("Password verified and data decrypted successfully.")
-                return True # Hash matches AND decryption succeeded
+                return True
         else:
-            # Hash doesn't match
             QMessageBox.critical(None, "Login Error", "Incorrect master password!")
             return False
             
-    # New method for first-time setup
     def setup_initial_password(self, new_password):
-        if self.master_password_hash: # Prevent accidental overwrite
+        if self.master_password_hash:
              print("Error: Attempted initial setup when password already exists.")
              return False
              
-        if not new_password:
+        if not new_password or not new_password.strip():
              print("Error: Setup password cannot be empty.")
              return False
              
         try:
-            # Ensure salt exists (should be generated by load_config if config was missing)
             if self.salt is None:
                  self.salt = os.urandom(16)
-                 print("Warning: Salt was missing during initial setup, generated new one.")
                  
-            self.master_password_hash = hashlib.sha256(new_password.encode()).hexdigest()
-            self.encryption_key = self.derive_key(new_password) # Uses self.salt
+            self.master_password_hash = self.hash_password(new_password, self.salt)
+            self.encryption_key = self.derive_key(new_password)
             if not self.encryption_key:
-                 # Reset state if key derivation fails
                  self.master_password_hash = None
-                 # Keep salt? Or regenerate? Keep for now.
                  raise Exception("Failed to derive encryption key during initial setup.")
                  
-            self.save_config() # Save hash and salt
-            # Don't encrypt empty data here, let the first save action do it
+            self.save_config()
             return True
         except Exception as e:
-             # Reset state on any setup error
-             self.master_password_hash = None
-             self.encryption_key = None
-             print(f"Error during initial password setup: {e}")
-             return False
+            self.master_password_hash = None
+            self.encryption_key = None
+            print(f"Error during initial password setup: {e}")
+            return False
 
     def add_password(self, website, username, password):
-        # Ensure key exists before adding - should be handled by GUI check now
         if not self.encryption_key:
              raise Exception("Cannot add password: Application not initialized with master password.")
-        entry = {"website": website, "username": username, "password": password}
+        entry = {"website": website.strip(), "username": username.strip(), "password": password}
         self.passwords.append(entry)
         self.encrypt_data()
 
@@ -489,22 +480,25 @@ class SecuredPasswordManager:
         return self.passwords
 
     def add_totp_account(self, name, secret):
-        # Ensure key exists before adding - should be handled by GUI check now
         if not self.encryption_key:
              raise Exception("Cannot add TOTP account: Application not initialized with master password.")
-        if not name or not secret:
+        clean_name = name.strip() if name else ""
+        if not clean_name or not secret or not secret.strip():
              raise ValueError("Account name and secret cannot be empty.")
         cleaned_secret = secret.replace(" ", "").upper()
         try:
-            pyotp.TOTP(cleaned_secret)
+            decoded = base64.b32decode(cleaned_secret, casefold=True)
+            if not decoded:
+                raise ValueError("Secret cannot decode to empty bytes.")
+            pyotp.TOTP(cleaned_secret).now()
         except Exception as e:
             print(f"Secret validation failed: {e}") 
             raise ValueError("Invalid Base32 secret format.")
             
-        if any(acc["name"].lower() == name.lower() for acc in self.totp_accounts):
-             raise ValueError(f"An account named '{name}' already exists.")
+        if any(acc["name"].strip().lower() == clean_name.lower() for acc in self.totp_accounts):
+             raise ValueError(f"An account named '{clean_name}' already exists.")
              
-        entry = {"name": name, "secret": cleaned_secret}
+        entry = {"name": clean_name, "secret": cleaned_secret}
         self.totp_accounts.append(entry)
         self.encrypt_data()
         
@@ -531,84 +525,66 @@ class SecuredPasswordManager:
         return None
 
     def change_master_password(self, current_password, new_password):
-        # 1. Verify current password
-        current_hash = hashlib.sha256(current_password.encode()).hexdigest()
-        if not self.master_password_hash or current_hash != self.master_password_hash:
+        salted_curr_hash = self.hash_password(current_password, self.salt)
+        legacy_curr_hash = hashlib.sha256(current_password.encode()).hexdigest()
+        
+        is_current_valid = secrets.compare_digest(salted_curr_hash, self.master_password_hash) if self.master_password_hash else False
+        if not is_current_valid and self.master_password_hash:
+            is_current_valid = secrets.compare_digest(legacy_curr_hash, self.master_password_hash)
+
+        if not is_current_valid:
             raise ValueError("Incorrect current master password.")
             
-        if not new_password:
+        if not new_password or not new_password.strip():
             raise ValueError("New password cannot be empty.")
 
-        # Ensure data is loaded (should be if logged in)
-        if self.encryption_key is None:
-            # This case should ideally not happen if the user is logged in
-            # Attempt to derive the key again to be safe
-             temp_key = self.derive_key(current_password)
-             if not temp_key:
-                  raise Exception("Could not derive current encryption key.")
-             # Attempt decryption to load data if not already loaded
-             # This reuses the existing self.decrypt_data logic
-             original_key = self.encryption_key
-             self.encryption_key = temp_key
-             if not self.decrypt_data():
-                  self.encryption_key = original_key # Restore original state on failure
-                  raise Exception("Failed to decrypt data with current password before changing.")
-             # If decryption succeeded here, self.passwords/totp_accounts are loaded
-             # but we need to restore the original key for the rest of the function
-             # before setting the new one. This path is unlikely but handled defensively.
-             self.encryption_key = original_key 
-
-        # Hold current data (decrypted state)
-        current_passwords = list(self.passwords) # Make copies
+        current_passwords = list(self.passwords)
         current_totp_accounts = list(self.totp_accounts)
 
-        # 2. Generate new salt, hash, key
         new_salt = os.urandom(16)
-        new_hash = hashlib.sha256(new_password.encode()).hexdigest()
-        new_key = self.derive_key(new_password, salt=new_salt) # Need to allow passing salt
+        new_hash = self.hash_password(new_password, new_salt)
+        new_key = self.derive_key(new_password, salt=new_salt)
         
         if not new_key:
              raise Exception("Failed to derive new encryption key.")
 
-        # 3. Update manager state
-        self.master_password_hash = new_hash
-        self.salt = new_salt
-        self.encryption_key = new_key
+        old_hash = self.master_password_hash
+        old_salt = self.salt
+        old_key = self.encryption_key
 
-        # 4. Save new config (hash, salt)
-        self.save_config()
-
-        # 5. Re-encrypt data with the new key
-        # Ensure the manager uses the temporarily stored data
-        self.passwords = current_passwords 
-        self.totp_accounts = current_totp_accounts
-        self.encrypt_data() # encrypt_data uses the new self.encryption_key
+        try:
+            self.master_password_hash = new_hash
+            self.salt = new_salt
+            self.encryption_key = new_key
+            self.passwords = current_passwords 
+            self.totp_accounts = current_totp_accounts
+            
+            # Re-encrypt data with the new key FIRST
+            self.encrypt_data()
+            # Only save new config after encryption succeeds
+            self.save_config()
+        except Exception as e:
+            # Revert state on failure
+            self.master_password_hash = old_hash
+            self.salt = old_salt
+            self.encryption_key = old_key
+            raise Exception(f"Failed to change master password: {e}")
         
-        return True # Indicate success
+        return True
         
-    # Add reset method
     def reset_application(self):
          try:
              if os.path.exists(self.config_file):
                  os.remove(self.config_file)
              if os.path.exists(self.data_file):
                  os.remove(self.data_file)
-             # Clear in-memory data as well
-             self.master_password_hash = None
-             self.salt = None
-             self.encryption_key = None
-             self.passwords = []
-             self.totp_accounts = []
              return True
-         except Exception as e:
-             print(f"Error resetting application files: {e}")
-             # Even if file removal fails, clear memory state
+         finally:
              self.master_password_hash = None
              self.salt = None
              self.encryption_key = None
              self.passwords = []
              self.totp_accounts = []
-             raise # Re-raise exception to inform caller
 
 # --- Setup Master Password Dialog (New) ---
 class SetupMasterPasswordDialog(QDialog):
@@ -656,7 +632,7 @@ class SetupMasterPasswordDialog(QDialog):
         new_pw = self.new_pass_entry.text()
         confirm_pw = self.confirm_pass_entry.text()
 
-        if not new_pw:
+        if not new_pw or not new_pw.strip():
             QMessageBox.warning(self, "Input Error", "Password cannot be empty.")
             self.new_pass_entry.setFocus()
             return
@@ -712,14 +688,23 @@ class MasterPasswordDialog(QDialog):
         # Focus the input field initially
         self.password_input.setFocus()
 
+    def accept(self):
+        pw = self.password_input.text()
+        if not pw or not pw.strip():
+            QMessageBox.warning(self, "Input Error", "Master password cannot be empty.")
+            self.password_input.setFocus()
+            return
+        super().accept()
+
     def getPassword(self):
         # Return entered text if dialog was accepted
         return self.password_input.text()
 
 # --- Add TOTP Account Dialog ---
 class AddTotpAccountDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, password_manager=None, parent=None):
         super().__init__(parent)
+        self.password_manager = password_manager
         self.setWindowTitle("Add Authenticator Account")
         self.setMinimumWidth(450)
         self.new_account_details = None
@@ -760,44 +745,60 @@ class AddTotpAccountDialog(QDialog):
             return
         scanned_data = None
         scan_window_name = "Scan TOTP QR Code - Press 'Q' to Quit"
-        while True:
-            ret, frame = cap.read()
-            if not ret: break
-            qrcodes = pyzbar.decode(frame)
-            found = False
-            for qr in qrcodes:
-                qr_data = qr.data.decode('utf-8')
-                if qr_data.startswith('otpauth://totp/'):
-                    scanned_data = qr_data
-                    found = True
-                    (x, y, w, h) = qr.rect
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                    cv2.putText(frame, "OTP QR Found! Press Q", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret: break
+                qrcodes = pyzbar.decode(frame)
+                found = False
+                for qr in qrcodes:
+                    qr_data = qr.data.decode('utf-8', errors='ignore')
+                    if qr_data.lower().startswith('otpauth://totp/'):
+                        scanned_data = qr_data
+                        found = True
+                        (x, y, w, h) = qr.rect
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                        cv2.putText(frame, "OTP QR Found!", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        break
+                cv2.imshow(scan_window_name, frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q') or found:
+                    if found:
+                        cv2.waitKey(300)
                     break
-            cv2.imshow(scan_window_name, frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q') or found: break
-        cap.release()
-        cv2.destroyWindow(scan_window_name)
-        cv2.waitKey(1); cv2.waitKey(1); cv2.waitKey(1); cv2.waitKey(1)
+        finally:
+            cap.release()
+            cv2.destroyWindow(scan_window_name)
+            for _ in range(4):
+                cv2.waitKey(1)
 
         if scanned_data:
             self.parse_otpauth_uri_internal(scanned_data)
-        # No message if cancelled, user just returns to dialog
             
     def parse_otpauth_uri_internal(self, uri):
         try:
             parsed_uri = urllib.parse.urlparse(uri)
             params = urllib.parse.parse_qs(parsed_uri.query)
             secret = params.get('secret', [None])[0]
-            if not secret: raise ValueError("Secret parameter not found")
-            path_parts = parsed_uri.path.strip('/').split(':', 1)
-            account_label = urllib.parse.unquote(path_parts[-1])
+            if not secret:
+                raise ValueError("Secret parameter not found in QR code.")
+            raw_path = parsed_uri.path.strip('/')
+            if ':' in raw_path:
+                path_issuer, account_label = raw_path.split(':', 1)
+                path_issuer = urllib.parse.unquote(path_issuer)
+                account_label = urllib.parse.unquote(account_label)
+            else:
+                path_issuer = None
+                account_label = urllib.parse.unquote(raw_path)
+
             issuer = params.get('issuer', [None])[0]
-            if issuer: issuer = urllib.parse.unquote(issuer)
+            effective_issuer = issuer or path_issuer
             suggested_name = account_label
-            if issuer and issuer.lower() not in account_label.lower():
-                 suggested_name = f"{issuer} ({account_label})"
+            if effective_issuer and account_label and effective_issuer.lower() not in account_label.lower():
+                 suggested_name = f"{effective_issuer} ({account_label})"
+            elif effective_issuer and not account_label:
+                 suggested_name = effective_issuer
+
             self.account_name_entry.setText(suggested_name)
             self.secret_key_entry.setText(secret)
             QMessageBox.information(self, "Scan Successful", "Account details populated. Verify and click OK.")
@@ -806,17 +807,32 @@ class AddTotpAccountDialog(QDialog):
             self.secret_key_entry.clear()
             self.account_name_entry.clear()
 
-    # Override accept to store data before closing
+    # Override accept to validate data before closing
     def accept(self):
         name = self.account_name_entry.text().strip()
         secret = self.secret_key_entry.text().strip()
         if not name or not secret:
             QMessageBox.warning(self, "Input Error", "Account name and secret key are required.")
-            return # Don't close dialog
+            return
         
-        # Store details for the main window to retrieve
-        self.new_account_details = {"name": name, "secret": secret}
-        super().accept() # Close dialog with Accepted state
+        cleaned_secret = secret.replace(" ", "").upper()
+        try:
+            decoded = base64.b32decode(cleaned_secret, casefold=True)
+            if not decoded:
+                raise ValueError("Secret is empty.")
+            pyotp.TOTP(cleaned_secret).now()
+        except Exception:
+            QMessageBox.warning(self, "Input Error", "Invalid Base32 secret format. Please check the secret key.")
+            self.secret_key_entry.setFocus()
+            return
+            
+        if self.password_manager and any(acc["name"].strip().lower() == name.lower() for acc in self.password_manager.totp_accounts):
+            QMessageBox.warning(self, "Input Error", f"An account named '{name}' already exists.")
+            self.account_name_entry.setFocus()
+            return
+
+        self.new_account_details = {"name": name, "secret": cleaned_secret}
+        super().accept()
 
     def get_new_account_details(self):
         return self.new_account_details
@@ -960,6 +976,9 @@ class PasswordManagerGUI(QMainWindow):
         self.password_manager.load_config()
         self.totp_timer = QTimer(self)
         self.totp_timer.timeout.connect(self.update_authenticator_display)
+        self.clipboard_timer = QTimer(self)
+        self.clipboard_timer.timeout.connect(self.clear_clipboard_if_matches)
+        self.clipboard_clear_text = None
         self.currently_selected_totp_index = -1
         self.currently_selected_index = -1
         self.init_ui()
@@ -978,6 +997,7 @@ class PasswordManagerGUI(QMainWindow):
 
         # --- Tab Widget --- 
         self.tabs = QTabWidget()
+        self.tabs.currentChanged.connect(self.on_tab_changed)
         main_v_layout.addWidget(self.tabs)
 
         # --- Create and Add Menu Button to Tab Bar Corner --- 
@@ -1001,9 +1021,9 @@ class PasswordManagerGUI(QMainWindow):
         add_tab_inner_layout = QVBoxLayout()
         add_tab_inner_layout.setSpacing(15)
         add_tab_inner_layout.setContentsMargins(0, 20, 0, 0) # Add top margin
-        # Constrain the width of the inner form area
-        add_tab_inner_layout.setSizeConstraint(QLayout.SizeConstraint.SetMaximumSize)
         form_widget = QWidget() # Widget to hold the inner layout and constraints
+        form_widget.setMinimumWidth(380)
+        form_widget.setMaximumWidth(500)
         form_widget.setLayout(add_tab_inner_layout)
         
         # Input fields using QGridLayout for label alignment
@@ -1027,6 +1047,15 @@ class PasswordManagerGUI(QMainWindow):
         self.password_entry = QLineEdit()
         self.password_entry.setEchoMode(QLineEdit.EchoMode.Password)
         password_hbox.addWidget(self.password_entry, 1) # Field takes stretch
+
+        # Show/Hide password toggle button
+        self.toggle_add_pass_button = QPushButton(QIcon(ICON_SHOW), "")
+        self.toggle_add_pass_button.setProperty("icon-button", True)
+        self.toggle_add_pass_button.setToolTip("Show/Hide Password")
+        self.toggle_add_pass_button.setCheckable(True)
+        self.toggle_add_pass_button.toggled.connect(self.toggle_add_password_visibility)
+        password_hbox.addWidget(self.toggle_add_pass_button)
+
         # Smaller Generate button next to password field
         generate_button = QPushButton(QIcon(ICON_GENERATE), "")
         generate_button.setProperty("icon-button", True)
@@ -1065,6 +1094,7 @@ class PasswordManagerGUI(QMainWindow):
 
         self.password_tree = QTreeWidget()
         self.password_tree.setHeaderLabels(["Website", "Username"])
+        self.password_tree.header().setStretchLastSection(True)
         self.password_tree.itemSelectionChanged.connect(self.display_entry_details)
         self.password_tree.setAlternatingRowColors(True)
         view_layout.addWidget(self.password_tree, 1)
@@ -1090,9 +1120,9 @@ class PasswordManagerGUI(QMainWindow):
         details_layout.addWidget(QLabel("Password:"), 2, 0)
         password_layout = QHBoxLayout()
         password_layout.setSpacing(5)
-        self.details_password_label = QLineEdit("********")
+        self.details_password_label = QLineEdit("-")
         self.details_password_label.setReadOnly(True)
-        self.details_password_label.setEchoMode(QLineEdit.EchoMode.Password)
+        self.details_password_label.setEchoMode(QLineEdit.EchoMode.Normal)
         self.details_password_label.setStyleSheet("background-color: transparent; border: none; padding: 0px;")
         self.details_password_label.setProperty("password_hidden", True)
         self.details_password_label.setProperty("actual_password", "")
@@ -1157,7 +1187,13 @@ class PasswordManagerGUI(QMainWindow):
         self.totp_details_code_label.setObjectName("CodeLabel")
         self.totp_details_code_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.totp_details_code_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextBrowserInteraction)
-        self.totp_details_code_label.mousePressEvent = self.copy_current_totp_code
+        
+        def on_code_label_click(event):
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.copy_current_totp_code()
+            QLabel.mousePressEvent(self.totp_details_code_label, event)
+        self.totp_details_code_label.mousePressEvent = on_code_label_click
+
         self.totp_details_code_label.setToolTip("Click code to copy")
         code_layout.addWidget(self.totp_details_code_label)
         copy_totp_button = QPushButton(QIcon(ICON_COPY), "")
@@ -1191,34 +1227,50 @@ class PasswordManagerGUI(QMainWindow):
 
         self.tabs.addTab(auth_tab, QIcon(ICON_TAB_AUTH), "Authenticator")
 
+    def on_tab_changed(self, index):
+        if index == 2 and self.currently_selected_totp_index != -1:
+            self.update_authenticator_display()
+            self.totp_timer.start(500)
+        else:
+            self.totp_timer.stop()
+
+    def toggle_add_password_visibility(self, checked):
+        if checked:
+            self.password_entry.setEchoMode(QLineEdit.EchoMode.Normal)
+            self.toggle_add_pass_button.setIcon(QIcon(ICON_HIDE))
+        else:
+            self.password_entry.setEchoMode(QLineEdit.EchoMode.Password)
+            self.toggle_add_pass_button.setIcon(QIcon(ICON_SHOW))
+
     def generate_password(self):
         password = secrets.token_urlsafe(16)
         self.password_entry.setText(password)
 
     def add_entry(self):
+        website = self.website_entry.text().strip()
+        username = self.username_entry.text().strip()
+        password = self.password_entry.text()
+
+        if not website or not username or not password:
+            QMessageBox.warning(self, "Input Error", "Please fill in Website, Username, and Password fields!")
+            return
+
         # Check if setup needed before proceeding
         if not self.ensure_master_password_set():
             return # Setup failed or was cancelled
             
-        website = self.website_entry.text()
-        username = self.username_entry.text()
-        password = self.password_entry.text()
-
-        if website and username and password:
-            try:
-                # Now safe to assume key exists if setup passed
-                self.password_manager.add_password(website, username, password)
-                QMessageBox.information(self, "Success", "Entry added successfully!")
-                self.website_entry.clear()
-                self.username_entry.clear()
-                self.password_entry.clear()
-                self.refresh_password_list()
-            except ValueError as e:
-                QMessageBox.critical(self, "Error", f"Failed to add entry: {e}")
-            except Exception as e:
-                 QMessageBox.critical(self, "Error", f"An unexpected error occurred: {e}")
-        else:
-            QMessageBox.warning(self, "Error", "Please fill in Website, Username, and Password fields!")
+        try:
+            # Now safe to assume key exists if setup passed
+            self.password_manager.add_password(website, username, password)
+            QMessageBox.information(self, "Success", "Entry added successfully!")
+            self.website_entry.clear()
+            self.username_entry.clear()
+            self.password_entry.clear()
+            self.refresh_password_list()
+        except ValueError as e:
+            QMessageBox.critical(self, "Error", f"Failed to add entry: {e}")
+        except Exception as e:
+             QMessageBox.critical(self, "Error", f"An unexpected error occurred: {e}")
             
     # New helper method to handle first-time password setup
     def ensure_master_password_set(self):
@@ -1241,7 +1293,6 @@ class PasswordManagerGUI(QMainWindow):
                        QMessageBox.critical(self, "Setup Error", f"An error occurred during setup: {e}")
                        return False # Setup failed
              else:
-                  # Should not happen if dialog validation works
                   QMessageBox.warning(self, "Setup Error", "Password was not provided by setup dialog.")
                   return False # Failed
         else:
@@ -1263,11 +1314,12 @@ class PasswordManagerGUI(QMainWindow):
                  
                  self.details_website_label.setText(entry.get('website', '-'))
                  self.details_username_label.setText(entry.get('username', '-'))
+                 self.details_password_label.setEchoMode(QLineEdit.EchoMode.Password)
                  self.details_password_label.setText("********")
                  self.details_password_label.setProperty("password_hidden", True)
                  self.details_password_label.setProperty("actual_password", entry.get('password', ''))
                  self.toggle_pass_button.setChecked(False)
-                 self.copy_password_button.setEnabled(False)
+                 self.copy_password_button.setEnabled(bool(entry.get('password')))
                  self.copy_username_button.setEnabled(bool(entry.get('username')))
             except Exception as e:
                  print(f"Error displaying entry details: {e}")
@@ -1279,6 +1331,7 @@ class PasswordManagerGUI(QMainWindow):
         self.currently_selected_index = -1
         self.details_website_label.setText("-")
         self.details_username_label.setText("-")
+        self.details_password_label.setEchoMode(QLineEdit.EchoMode.Normal)
         self.details_password_label.setText("-")
         self.details_password_label.setProperty("password_hidden", True)
         self.details_password_label.setProperty("actual_password", "")
@@ -1300,7 +1353,7 @@ class PasswordManagerGUI(QMainWindow):
                 self.details_password_label.setText("********")
                 self.toggle_pass_button.setIcon(QIcon(ICON_SHOW))
                 self.toggle_pass_button.setToolTip("Show Password")
-                self.copy_password_button.setEnabled(False)
+                self.copy_password_button.setEnabled(bool(actual_password))
         else:
             self.toggle_pass_button.setChecked(False)
             self.toggle_pass_button.setIcon(QIcon(ICON_SHOW))
@@ -1310,8 +1363,9 @@ class PasswordManagerGUI(QMainWindow):
         if self.currently_selected_index != -1:
             if self.currently_selected_index < len(self.password_manager.passwords):
                  entry_name = self.password_manager.get_password(self.currently_selected_index).get('website', 'this entry')
+                 escaped_name = html.escape(entry_name)
                  reply = QMessageBox.question(self, 'Confirm Delete', 
-                                            f"Are you sure you want to delete the password entry for '{entry_name}'?",
+                                            f"Are you sure you want to delete the password entry for '<b>{escaped_name}</b>'?",
                                             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
                                             QMessageBox.StandardButton.No)
                  if reply == QMessageBox.StandardButton.Yes:
@@ -1341,14 +1395,14 @@ class PasswordManagerGUI(QMainWindow):
         if not self.ensure_master_password_set():
              return # Setup failed or was cancelled
              
-        dialog = AddTotpAccountDialog(self)
+        dialog = AddTotpAccountDialog(self.password_manager, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
              details = dialog.get_new_account_details()
              if details:
                   try:
                        # Now safe to assume key exists
                        self.password_manager.add_totp_account(details["name"], details["secret"])
-                       QMessageBox.information(self, "Success", f"Authenticator account '{details['name']}' added successfully!")
+                       QMessageBox.information(self, "Success", f"Authenticator account '{html.escape(details['name'])}' added successfully!")
                        self.refresh_totp_list()
                   except ValueError as e:
                        QMessageBox.critical(self, "Error", f"Failed to add account: {e}")
@@ -1366,7 +1420,7 @@ class PasswordManagerGUI(QMainWindow):
                       return
                       
                   account = self.password_manager.get_totp_account(self.currently_selected_totp_index)
-                  self.totp_details_name_label.setText(f"<b>{account.get('name', '-')}</b>")
+                  self.totp_details_name_label.setText(f"<b>{html.escape(account.get('name', '-'))}</b>")
                   self.update_authenticator_display()
                   self.totp_timer.start(500)
               except Exception as e:
@@ -1402,9 +1456,11 @@ class PasswordManagerGUI(QMainWindow):
                      self.totp_progressbar.setValue(progress_value) 
                      self.totp_seconds_label.setText(f"{remaining_int}s remaining")
                      is_expiring = remaining_int < 5
-                     self.totp_details_code_label.setProperty("expiring", is_expiring)
-                     self.totp_details_code_label.style().unpolish(self.totp_details_code_label)
-                     self.totp_details_code_label.style().polish(self.totp_details_code_label)
+                     was_expiring = self.totp_details_code_label.property("expiring")
+                     if was_expiring != is_expiring:
+                         self.totp_details_code_label.setProperty("expiring", is_expiring)
+                         self.totp_details_code_label.style().unpolish(self.totp_details_code_label)
+                         self.totp_details_code_label.style().polish(self.totp_details_code_label)
                  elif code == "Error":
                      self.totp_details_code_label.setText("Error") 
                      self.totp_progressbar.setValue(0)
@@ -1432,8 +1488,9 @@ class PasswordManagerGUI(QMainWindow):
         if self.currently_selected_totp_index != -1:
             if self.currently_selected_totp_index < len(self.password_manager.totp_accounts):
                 account = self.password_manager.get_totp_account(self.currently_selected_totp_index)
+                escaped_name = html.escape(account.get('name', ''))
                 reply = QMessageBox.question(self, 'Confirm Delete', 
-                                           f"Are you sure you want to delete the authenticator account for '{account.get('name')}'?",
+                                           f"Are you sure you want to delete the authenticator account for '<b>{escaped_name}</b>'?",
                                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
                                            QMessageBox.StandardButton.No)
                 if reply == QMessageBox.StandardButton.Yes:
@@ -1455,12 +1512,34 @@ class PasswordManagerGUI(QMainWindow):
         if not text:
             return
         try:
-            pyperclip.copy(text)
-            self.status_bar.showMessage("Copied to clipboard!", 1500) 
-        except Exception as e:
-            print(f"Clipboard error: {e}")
-            QMessageBox.warning(self, "Clipboard Error", f"Could not copy to clipboard: {e}")
-            self.status_bar.showMessage("Clipboard error.", 1500)
+            clipboard = QApplication.clipboard()
+            if clipboard:
+                clipboard.setText(text)
+            else:
+                pyperclip.copy(text)
+            self.status_bar.showMessage("Copied to clipboard! (Clears in 45s)", 2500)
+            self.clipboard_clear_text = text
+            self.clipboard_timer.start(45000)
+        except Exception:
+            try:
+                pyperclip.copy(text)
+                self.status_bar.showMessage("Copied to clipboard! (Clears in 45s)", 2500)
+                self.clipboard_clear_text = text
+                self.clipboard_timer.start(45000)
+            except Exception as e2:
+                print(f"Clipboard error: {e2}")
+                QMessageBox.warning(self, "Clipboard Error", f"Could not copy to clipboard: {e2}")
+                self.status_bar.showMessage("Clipboard error.", 1500)
+
+    def clear_clipboard_if_matches(self):
+        self.clipboard_timer.stop()
+        try:
+            clipboard = QApplication.clipboard()
+            if clipboard and clipboard.text() == getattr(self, 'clipboard_clear_text', None):
+                clipboard.clear()
+                self.status_bar.showMessage("Clipboard cleared for security.", 2000)
+        except Exception:
+            pass
 
     def load_settings(self):
         settings = QSettings(ORG_NAME, APP_NAME)
@@ -1469,8 +1548,10 @@ class PasswordManagerGUI(QMainWindow):
             self.restoreGeometry(geometry)
         else:
             self.resize(800, 600) 
-            screen_geometry = QApplication.primaryScreen().availableGeometry()
-            self.move(screen_geometry.center() - self.frameGeometry().center())
+            screen = QApplication.primaryScreen()
+            if screen:
+                screen_geometry = screen.availableGeometry()
+                self.move(screen_geometry.center() - self.frameGeometry().center())
 
     def save_settings(self):
         settings = QSettings(ORG_NAME, APP_NAME)
@@ -1485,31 +1566,22 @@ class PasswordManagerGUI(QMainWindow):
         
         # Check if a master password hash exists (i.e., setup has been done)
         if self.password_manager.master_password_hash:
-            # Existing user: Prompt for password
-            dialog = MasterPasswordDialog(self)
-            if dialog.exec() == QDialog.DialogCode.Accepted:
-                 master_password = dialog.getPassword()
-                 if master_password: 
-                      # Verify password and attempt decryption
-                      if self.password_manager.verify_master_password(master_password):
-                           # Success: Load UI data
-                           self.refresh_password_list()
-                           self.refresh_totp_list()
-                           self.show() # Show main window AFTER successful login
-                      else:
-                           # Verification/Decryption failed (error shown by verify method)
-                           sys.exit()
-                 else:
-                      QMessageBox.warning(self, "Input Error", "Master password cannot be empty.")
-                      sys.exit()
-            else:
-                 # Dialog was cancelled
-                 QMessageBox.warning(self, "Cancelled", "Master password entry cancelled.")
-                 sys.exit()
+            while True:
+                dialog = MasterPasswordDialog(self)
+                if dialog.exec() == QDialog.DialogCode.Accepted:
+                     master_password = dialog.getPassword()
+                     if master_password: 
+                          if self.password_manager.verify_master_password(master_password):
+                               self.refresh_password_list()
+                               self.refresh_totp_list()
+                               self.show()
+                               break
+                          # Incorrect password error shown by verify method; loop re-prompts
+                     else:
+                          QMessageBox.warning(self, "Input Error", "Master password cannot be empty.")
+                else:
+                     sys.exit()
         else:
-             # First run or post-reset: No master password set yet.
-             # Show the main window directly without login.
-             # User will be prompted when they try to save data.
              self.status_bar.showMessage("Ready - No Master Password Set")
              self.show()
 
@@ -1528,8 +1600,6 @@ class PasswordManagerGUI(QMainWindow):
     
     def show_main_menu(self):
         menu = QMenu(self)
-        # Apply stylesheet to menu for consistency (optional)
-        # menu.setStyleSheet(self.styleSheet()) # Inherit main style
 
         about_action = QAction(QIcon(ICON_ABOUT), "About Passvyn", self)
         about_action.triggered.connect(self.show_about_dialog)
@@ -1551,17 +1621,15 @@ class PasswordManagerGUI(QMainWindow):
         settings_action.triggered.connect(self.show_settings)
         menu.addAction(settings_action)
 
-        # Position menu below button (adjust slightly for corner widget)
         button_global_pos = self.menu_button.mapToGlobal(QPoint(0, self.menu_button.height()))
         menu.exec(button_global_pos)
 
     # --- Menu Action Handlers --- 
     def show_about_dialog(self):
-        # Simple About Box
         QMessageBox.about(self, 
             "About Passvyn",
             "<b>Passvyn: Password Manager</b><br><br>" 
-            "Version: 1.0 (Conceptual)<br>" 
+            "Version: 1.0<br>" 
             "A secure place for your passwords and codes.<br><br>" 
             "Developed by Vaibhav Pratap Singh"
         )
@@ -1581,13 +1649,7 @@ class PasswordManagerGUI(QMainWindow):
 
         if fileName:
             try:
-                # 1. Get current salt
                 current_salt_b64 = base64.b64encode(self.password_manager.salt).decode()
-                
-                # 2. Encrypt *just* the data (using current instance key)
-                #    We need to temporarily encrypt data without writing to file.
-                #    Let's add a helper to encrypt_data to return blob without writing.
-                #    OR, create a temporary Fernet instance here.
                 temp_fernet = Fernet(self.password_manager.encryption_key)
                 data_to_encrypt = {
                     "passwords": self.password_manager.passwords,
@@ -1595,13 +1657,21 @@ class PasswordManagerGUI(QMainWindow):
                 }
                 encrypted_blob = temp_fernet.encrypt(json.dumps(data_to_encrypt).encode())
                 
-                # 3. Write salt then blob to backup file
-                with open(fileName, "wb") as file:
-                     file.write(current_salt_b64.encode() + b'\n') # Salt + newline
-                     file.write(encrypted_blob) # Encrypted data
+                os.makedirs(os.path.dirname(os.path.abspath(fileName)), exist_ok=True)
+                temp_fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(fileName)), prefix="bkp_", suffix=".tmp")
+                try:
+                    with os.fdopen(temp_fd, "wb") as file:
+                         file.write(current_salt_b64.encode() + b'\n')
+                         file.write(encrypted_blob)
+                    os.chmod(temp_path, 0o600)
+                    os.replace(temp_path, fileName)
+                except Exception:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                    raise
                      
                 self.status_bar.showMessage(f"Backup successful: {fileName}", 5000)
-                QMessageBox.information(self, "Backup Successful", f"Data successfully backed up to:<br>{fileName}")
+                QMessageBox.information(self, "Backup Successful", f"Data successfully backed up to:<br>{html.escape(fileName)}")
                      
             except Exception as e:
                 QMessageBox.critical(self, "Backup Failed", f"Could not create backup file: {e}")
@@ -1639,7 +1709,6 @@ class PasswordManagerGUI(QMainWindow):
              
         # --- Attempt Restore --- 
         try:
-            # 1. Read backup file (salt + blob)
             with open(fileName, "rb") as file:
                 backup_content = file.read()
             
@@ -1650,38 +1719,45 @@ class PasswordManagerGUI(QMainWindow):
             salt_b64_bytes, encrypted_blob = parts
             salt_b64 = salt_b64_bytes.decode()
             
-            # 2. Decode the salt from backup
             backup_salt = base64.b64decode(salt_b64)
             if len(backup_salt) != 16:
                  raise ValueError("Invalid backup file format: Incorrect salt length.")
 
-            # 3. Derive the key using backup password and backup salt
             decryption_key = self.password_manager.derive_key(backup_password, salt=backup_salt)
             if not decryption_key:
                 raise Exception("Failed to derive decryption key from provided password and backup salt.")
 
-            # 4. Attempt to decrypt the blob using the derived key
             loaded_data = self.password_manager.decrypt_data(encrypted_blob=encrypted_blob, decryption_key=decryption_key)
 
             if loaded_data:
-                # 5. Decryption successful! Update application state.
                 restored_passwords = loaded_data.get("passwords", [])
                 restored_totp = loaded_data.get("totp_accounts", [])
                 
-                # Update manager state
-                self.password_manager.passwords = restored_passwords
-                self.password_manager.totp_accounts = restored_totp
-                self.password_manager.salt = backup_salt # Use the restored salt!
-                # Generate new hash for the provided password
-                self.password_manager.master_password_hash = hashlib.sha256(backup_password.encode()).hexdigest()
-                # Use the key we already derived
-                self.password_manager.encryption_key = decryption_key
+                old_passwords = self.password_manager.passwords
+                old_totp = self.password_manager.totp_accounts
+                old_salt = self.password_manager.salt
+                old_hash = self.password_manager.master_password_hash
+                old_key = self.password_manager.encryption_key
 
-                # 6. Save new config and data files
-                self.password_manager.save_config() # Saves new hash, restored salt
-                self.password_manager.encrypt_data() # Saves new data.enc with new key
+                try:
+                    self.password_manager.passwords = restored_passwords
+                    self.password_manager.totp_accounts = restored_totp
+                    self.password_manager.salt = backup_salt
+                    self.password_manager.master_password_hash = self.password_manager.hash_password(backup_password, backup_salt)
+                    self.password_manager.encryption_key = decryption_key
 
-                # 7. Refresh UI
+                    # Encrypt data with the new key FIRST
+                    self.password_manager.encrypt_data()
+                    # Only save new config after encryption succeeds
+                    self.password_manager.save_config()
+                except Exception as e:
+                    self.password_manager.passwords = old_passwords
+                    self.password_manager.totp_accounts = old_totp
+                    self.password_manager.salt = old_salt
+                    self.password_manager.master_password_hash = old_hash
+                    self.password_manager.encryption_key = old_key
+                    raise Exception(f"Failed to write restored data: {e}")
+
                 self.refresh_password_list()
                 self.refresh_totp_list()
                 self.clear_entry_details()
@@ -1689,7 +1765,6 @@ class PasswordManagerGUI(QMainWindow):
                 self.status_bar.showMessage("Restore successful! Data reloaded.", 5000)
                 QMessageBox.information(self, "Restore Successful", "Data successfully restored and reloaded.")
             else:
-                # Decryption failed - password was wrong for this backup/salt
                 QMessageBox.critical(self, "Restore Failed", "Failed to decrypt the backup file.\n\nThis means the password entered was incorrect for this specific backup file, or the file is corrupt.")
                 self.status_bar.showMessage("Restore failed: Decryption error.", 5000)
 
@@ -1698,10 +1773,8 @@ class PasswordManagerGUI(QMainWindow):
             self.status_bar.showMessage("Restore failed.", 3000)
 
     def show_settings(self):
-        # Pass the password manager instance to the dialog
         dialog = SettingsDialog(self.password_manager, self)
         dialog.exec()
-        # No refresh needed usually unless settings affect live data directly
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
