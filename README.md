@@ -48,6 +48,10 @@ To run the **Secured Password Manager**, you need to have the following installe
    **Required dependencies**:
    - `PyQt6`
    - `cryptography`
+   - `pyotp`
+   - `opencv-python`
+   - `pyzbar`
+   - `pyperclip`
 
 3. **Configuration Files**:
    When you first run the application, it will automatically create the necessary configuration and password files.
@@ -94,18 +98,16 @@ The main files of the project include:
 
 - **`main.py`**: The primary Python script containing the application logic and GUI.
 - **`config.json`**: A configuration file where the master password hash and salt are stored.
-- **`passwords.enc`**: A file that stores the encrypted passwords.
+- **`data.enc`**: A file that stores the encrypted passwords and authenticator accounts.
 - **`requirements.txt`**: Contains the list of required Python packages.
 
 ## Security Mechanisms
 
-- **Master Password**: The master password is hashed using SHA-256 and stored in a configuration file. The hash is used to verify the password on future logins.
-- **Encryption Key Derivation**: The encryption key is derived from the master password using PBKDF2 (Password-Based Key Derivation Function) with SHA-256, a secure cryptographic algorithm. A unique salt is used to prevent dictionary attacks.
-- **Fernet Encryption**: Passwords are encrypted and decrypted using the **Fernet** symmetric encryption from the `cryptography` library.
-- **Encrypted File**: Passwords are stored in the `passwords.enc` file, which is encrypted using the Fernet encryption algorithm.
+- **Master Password**: The master password is cryptographically salted and hashed. The hash is used to securely verify the password on logins.
+- **Encryption Key Derivation**: The encryption key is derived from the master password using PBKDF2 (Password-Based Key Derivation Function) with SHA-256 and a unique 16-byte salt.
+- **Fernet Encryption**: Passwords and TOTP secrets are encrypted and decrypted using symmetric **Fernet** encryption from the `cryptography` library.
+- **Encrypted File**: Passwords and accounts are stored in the `data.enc` file, which is encrypted using the Fernet encryption scheme.
 
-## Introduction
-The **Secured Password Manager** is a desktop application built using **PyQt6** and **Cryptography** li>
 ## Customization
 
 - **Styling**: The look and feel of the application can be customized by modifying the `ModernStyle.set_style()` method. You can adjust the colors, borders, and styles of various widgets.
