@@ -1,5 +1,6 @@
 PyQt6
 cryptography
+argon2-cffi
 pyotp
 opencv-python
 pyzbar

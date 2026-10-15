@@ -103,8 +103,8 @@ The main files of the project include:
 
 ## Security Mechanisms
 
-- **Master Password**: The master password is cryptographically salted and hashed. The hash is used to securely verify the password on logins.
-- **Encryption Key Derivation**: The encryption key is derived from the master password using PBKDF2 (Password-Based Key Derivation Function) with SHA-256 and a unique 16-byte salt.
+- **Master Password**: Verified against an Argon2id hash (via `argon2-cffi`). Configs from older versions that stored a SHA-256 hash are upgraded to Argon2id on the next login.
+- **Encryption Key Derivation**: The encryption key is derived from the master password using PBKDF2-HMAC-SHA256 (100,000 iterations) and a random 16-byte salt.
 - **Fernet Encryption**: Passwords and TOTP secrets are encrypted and decrypted using symmetric **Fernet** encryption from the `cryptography` library.
 - **Encrypted File**: Passwords and accounts are stored in the `data.enc` file, which is encrypted using the Fernet encryption scheme.
 

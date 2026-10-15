@@ -16,6 +16,8 @@ from PyQt6.QtGui import QPalette, QColor, QAction, QIcon
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError
 import base64
 import pyotp
 import time
@@ -262,14 +264,39 @@ class SecuredPasswordManager:
         self.master_password_hash = None
         self.encryption_key = None
         self.salt = None
+        self.password_hasher = PasswordHasher()
         self.config_file = os.path.join(BASE_DIR, "config.json")
         self.data_file = os.path.join(BASE_DIR, "data.enc")
 
-    def hash_password(self, password, salt=None):
-        use_salt = salt if salt is not None else self.salt
-        if use_salt is None:
-            raise ValueError("Salt is required to hash password.")
-        return hashlib.sha256(use_salt + password.encode()).hexdigest()
+    def hash_password(self, password):
+        # Argon2id with a random salt stored inside the hash string
+        return self.password_hasher.hash(password)
+
+    def check_master_password(self, password):
+        stored = self.master_password_hash
+        if not stored:
+            return False
+
+        if stored.startswith("$argon2"):
+            try:
+                self.password_hasher.verify(stored, password)
+            except (VerificationError, InvalidHashError):
+                return False
+            if self.password_hasher.check_needs_rehash(stored):
+                self.master_password_hash = self.hash_password(password)
+                self.save_config()
+            return True
+
+        # Older configs stored a single SHA-256, salted or unsalted.
+        # Accept them once and upgrade to Argon2.
+        legacy_hashes = [hashlib.sha256(password.encode()).hexdigest()]
+        if self.salt is not None:
+            legacy_hashes.append(hashlib.sha256(self.salt + password.encode()).hexdigest())
+        if not any(secrets.compare_digest(h, stored) for h in legacy_hashes):
+            return False
+        self.master_password_hash = self.hash_password(password)
+        self.save_config()
+        return True
 
     def load_config(self):
         # Reset state first
@@ -408,17 +435,7 @@ class SecuredPasswordManager:
              QMessageBox.critical(None, "Login Error", "Configuration missing or invalid. Cannot verify password.")
              return False
 
-        salted_hash = self.hash_password(master_password, self.salt)
-        legacy_hash = hashlib.sha256(master_password.encode()).hexdigest()
-
-        is_valid = secrets.compare_digest(salted_hash, self.master_password_hash)
-        if not is_valid and secrets.compare_digest(legacy_hash, self.master_password_hash):
-             is_valid = True
-             # Upgrade to salted hash
-             self.master_password_hash = salted_hash
-             self.save_config()
-
-        if is_valid:
+        if self.check_master_password(master_password):
             self.encryption_key = self.derive_key(master_password)
             if not self.encryption_key:
                  QMessageBox.critical(None, "Login Error", "Internal error: Failed to derive encryption key.")
@@ -448,7 +465,7 @@ class SecuredPasswordManager:
             if self.salt is None:
                  self.salt = os.urandom(16)
                  
-            self.master_password_hash = self.hash_password(new_password, self.salt)
+            self.master_password_hash = self.hash_password(new_password)
             self.encryption_key = self.derive_key(new_password)
             if not self.encryption_key:
                  self.master_password_hash = None
@@ -525,14 +542,7 @@ class SecuredPasswordManager:
         return None
 
     def change_master_password(self, current_password, new_password):
-        salted_curr_hash = self.hash_password(current_password, self.salt)
-        legacy_curr_hash = hashlib.sha256(current_password.encode()).hexdigest()
-        
-        is_current_valid = secrets.compare_digest(salted_curr_hash, self.master_password_hash) if self.master_password_hash else False
-        if not is_current_valid and self.master_password_hash:
-            is_current_valid = secrets.compare_digest(legacy_curr_hash, self.master_password_hash)
-
-        if not is_current_valid:
+        if not self.check_master_password(current_password):
             raise ValueError("Incorrect current master password.")
             
         if not new_password or not new_password.strip():
@@ -542,7 +552,7 @@ class SecuredPasswordManager:
         current_totp_accounts = list(self.totp_accounts)
 
         new_salt = os.urandom(16)
-        new_hash = self.hash_password(new_password, new_salt)
+        new_hash = self.hash_password(new_password)
         new_key = self.derive_key(new_password, salt=new_salt)
         
         if not new_key:
